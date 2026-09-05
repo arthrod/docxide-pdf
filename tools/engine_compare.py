@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Side-by-side engine comparison: Word reference | docxide-pdf | LibreOffice | MiniPdf | rdocx.
+"""Side-by-side engine comparison: Word reference | docxide-pdf | LibreOffice | MiniPdf | rdocx | jubarte-redlines.
 
 Reuses PNGs the test harness already produced under tests/output/<group>/<case>/
 (reference/, generated/, libreoffice/) and only converts what is missing. Conversions and
@@ -15,6 +15,7 @@ Usage:
     python3 tools/engine_compare.py --html-only     # rebuild index.html from the cached manifest, no re-scoring
 
 rdocx: `rdocx` on PATH (cargo install rdocx) or RDOCX_BIN.
+jubarte-redlines: `jubarte` on PATH (cargo install jubarte-redlines) or JUBARTE_BIN.
 MiniPdf: the Rust crate's CLI, `minipdf` on PATH (cargo install minipdf-cli) or MINIPDF_BIN.
 The .NET engine is a different implementation and is deliberately not what we compare against.
 """
@@ -52,6 +53,7 @@ ENGINES = [
     ("libreoffice", "LibreOffice"),
     ("minipdf", "MiniPdf (Rust)"),
     ("rdocx", "rdocx"),
+    ("jubarte", "jubarte-redlines"),
 ]
 COMPETITORS = [k for k, _ in ENGINES if k != "reference"]
 
@@ -82,6 +84,14 @@ def find_rdocx() -> Path | None:
         return Path(env)
     found = shutil.which("rdocx")
     return Path(found) if found else None
+
+
+def find_jubarte() -> Path | None:
+    env = os.environ.get("JUBARTE_BIN")
+    if env and Path(env).is_file():
+        return Path(env)
+    found = shutil.which("jubarte") or str(Path.home() / ".cargo" / "bin" / "jubarte")
+    return Path(found) if Path(found).is_file() else None
 
 
 def ensure_built(bin_path: Path, cwd: Path, *cargo_args: str, always: bool = False) -> Path | None:
@@ -159,6 +169,16 @@ def convert_rdocx(rdocx: Path, docx: Path, pdf: Path) -> bool:
     return pdf.exists()
 
 
+def convert_jubarte(jubarte: Path, docx: Path, pdf: Path) -> bool:
+    if is_fresh(pdf, docx):
+        return True
+    pdf.parent.mkdir(parents=True, exist_ok=True)
+    # --force: the CLI refuses to clobber an existing output by default.
+    subprocess.run([str(jubarte), "convert", str(docx), "-o", str(pdf), "--force"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300, check=False)
+    return pdf.exists()
+
+
 def run_out(cmd: list[str]) -> str:
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout.strip()
@@ -180,7 +200,7 @@ def engine_versions(tools: dict) -> dict[str, str]:
     v["generated"] = f"{m.group(1) if m else '?'} @{sha}{dirty}"
     if tools.get("soffice"):
         v["libreoffice"] = " ".join(run_out([str(tools["soffice"]), "--version"]).split()[:2])  # drop the build hash
-    for key in ("minipdf", "rdocx"):
+    for key in ("minipdf", "rdocx", "jubarte"):
         if tools.get(key):
             v[key] = run_out([str(tools[key]), "--version"]).split()[-1]
     return v
@@ -245,6 +265,9 @@ def process_fixture(fixture: Path, group: str, tools: dict, opts) -> dict | None
 
     if tools.get("rdocx") and convert_rdocx(tools["rdocx"], docx, mine / "rdocx.pdf"):
         add("rdocx", mine / "rdocx.pdf", mine / "rdocx")
+
+    if tools.get("jubarte") and convert_jubarte(tools["jubarte"], docx, mine / "jubarte.pdf"):
+        add("jubarte", mine / "jubarte.pdf", mine / "jubarte")
 
     scores: dict[str, dict] = {}
     if not opts.no_scores:
@@ -329,7 +352,7 @@ kbd { background:#333; border:1px solid #555; border-radius:3px; padding:0 4px; 
     <input type="range" id="alpha" min="0" max="100" value="50">
   </span>
   <span class="grp"><button id="viewToggle">Scores table</button></span>
-  <span style="color:var(--muted)"><kbd>1</kbd>-<kbd>5</kbd> engines &nbsp;<kbd>&uarr;</kbd><kbd>&darr;</kbd> cases &nbsp;<kbd>o</kbd> overlay &nbsp;<kbd>m</kbd> more pages &nbsp;<kbd>t</kbd> scores table</span>
+  <span style="color:var(--muted)"><kbd>1</kbd>-<kbd>6</kbd> engines &nbsp;<kbd>&uarr;</kbd><kbd>&darr;</kbd> cases &nbsp;<kbd>o</kbd> overlay &nbsp;<kbd>m</kbd> more pages &nbsp;<kbd>t</kbd> scores table</span>
 </div>
 <div id="legend"></div>
 <div id="side"><input id="filter" placeholder="filter cases (name, group)…"><div id="list"></div></div>
@@ -595,6 +618,7 @@ def main() -> None:
     ap.add_argument("--skip-libreoffice", action="store_true")
     ap.add_argument("--skip-minipdf", action="store_true")
     ap.add_argument("--skip-rdocx", action="store_true")
+    ap.add_argument("--skip-jubarte", action="store_true")
     ap.add_argument("--no-scores", action="store_true", help="skip Jaccard scoring")
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--open", action="store_true", help="open the HTML when done")
@@ -605,7 +629,9 @@ def main() -> None:
     opts = ap.parse_args()
 
     def load_manifest() -> dict:
-        m = json.loads(MANIFEST.read_text()) if MANIFEST.exists() else {}
+        # [] (not {}): a first filtered run has no manifest yet, and the list branch
+        # below then yields an empty-but-well-formed manifest instead of a KeyError.
+        m = json.loads(MANIFEST.read_text()) if MANIFEST.exists() else []
         return {"versions": {}, "cases": m} if isinstance(m, list) else m  # pre-versions manifests were a bare list
 
     def finish(results: list[dict], versions: dict) -> None:
@@ -645,6 +671,10 @@ def main() -> None:
         tools["rdocx"] = find_rdocx()
         if not tools["rdocx"]:
             print("rdocx not found; skipping (cargo install rdocx, or RDOCX_BIN)")
+    if not opts.skip_jubarte:
+        tools["jubarte"] = find_jubarte()
+        if not tools["jubarte"]:
+            print("jubarte not found; skipping (cargo install jubarte-redlines, or JUBARTE_BIN)")
     if not opts.no_scores:
         # Release: SSIM over a 205-page fixture is painfully slow unoptimized.
         ensure_built(METRICS_BIN, ROOT / "tools", "--release", "--bin", "page-metrics")
